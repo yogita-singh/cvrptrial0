@@ -1,0 +1,287 @@
+Full QUBO Solver
+no. of vehicles = M
+no. of clients = N
+no. of depots = N+1
+cost of moving from node i to node j = Cij 
+
+
+
+
+Code cell <LIYdV8MVtH-a>
+#%% [code]
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+
+from collections import Counter
+from matplotlib.colors import rgb2hex
+#from vehicle_routing import VehicleRouter
+#from qiskit_optimization import QuadraticProgram
+
+
+Code cell <vh5L0ASlFn6D>
+#%% [code]
+class VehicleRouter:
+
+   
+    def __init__(self, n_clients, n_vehicles, cost_matrix, **params):
+
+        """Initializes the VRP by storing all inputs, initializing variables for storing the quadratic structures and
+        results and calls the rebuild function to build all quadratic structures.
+        Args:
+            n_clients: No. of nodes in the problem (excluding the depot).
+            n_vehicles: No. of vehicles available for delivery.
+            cost_matrix: (n_clients + 1) x (n_clients + 1) matrix describing the cost of moving from node i to node j.
+            penalty: Penalty value to use for constraints in the QUBO. Defaults to automatic calculation by qiskit
+                converters.
+            chain_strength: Chain strength to be used for D-Wave sampler. Defaults to automatic chain strength
+                calculation via uniform torque compensation.
+            num_reads: Number of samples to read. Defaults to 1000.
+            solver: Select a backend solver. Defaults to 'dwave'.
+        """
+
+        # Store critical inputs
+        self.n = n_clients
+        self.m = n_vehicles
+        self.cost = np.array(cost_matrix)
+
+        # Extract parameters
+        self.penalty = params.setdefault('constraint_penalty', None)
+        self.chain_strength = params.setdefault('chain_strength', partial(uniform_torque_compensation, prefactor=2))
+        self.num_reads = params.setdefault('num_reads', 10)
+        self.solver = params.setdefault('solver', 'dwave')
+
+       
+
+        # Initialize result containers
+        self.result = None
+        self.solution = None
+
+        # Initialize timer
+        self.clock = None
+        self.timing = {}
+
+        # Initialize backend
+        self.backend = SolverBackend(self)
+
+        # Build quadratic models
+        self.rebuild()
+
+    def build_quadratic_program(self):
+
+        """Dummy function to be overriden in child class. Required to set self.variables to contain the names of all
+        variables in the form of a numpy array and self.qp to contain the quadratic program to be solved."""
+
+        # Dummy. Override in child class.
+        pass
+
+    def build_bqm(self):
+
+        """Converts the quadratic program in self.qp to a QUBO by appending all constraints to the objective function
+        in the form of penalties and then builds a BQM from the QUBO for solving by D-Wave."""
+
+        # Convert to QUBO
+        converter = QuadraticProgramToQubo(penalty=self.penalty)
+        self.qubo = converter.convert(self.qp)
+
+        # Extract qubo data
+        Q = self.qubo.objective.quadratic.to_dict(use_name=True)
+        g = self.qubo.objective.linear.to_dict(use_name=True)
+        c = self.qubo.objective.constant
+
+        # Build BQM
+        self.bqm = dimod.BQM(g, Q, c, dimod.BINARY)
+
+    
+    def extract_solution(self, result_dict):
+
+        """Uses a result dictionary mapping variable names to the solved solution to build the self.solution variable
+        in the same shape as self.variables and containing the corresponding solutions.
+        Args:
+            result_dict: Dictionary mapping variable names to solved values for these variables.
+        """
+
+        # Extract solution from result dictionary
+        var_list = self.variables.reshape(-1)
+        self.solution = np.zeros(var_list.shape)
+        for i in range(len(var_list)):
+            self.solution[i] = result_dict[var_list[i]]
+
+        # Reshape result
+        self.solution = self.solution.reshape(self.variables.shape)
+
+    def evaluate_vrp_cost(self):
+
+        """Evaluate the optimized VRP cost under the optimized solution stored in self.solution.
+        Returns:
+            Optimized VRP cost as a float value.
+        """
+
+        # Return optimized energy
+        if type(self.result) == OptimizationResult:
+            return self.result.fval
+        else:
+            return self.result.first.energy
+
+    def evaluate_qubo_feasibility(self, data=None):
+
+        """Evaluates whether the QUBO is feasible under the supplied data as inputs. If this data is not
+        supplied, the self.solution variable is used instead.
+        Args:
+            data: Values of the variables in the solution to be tested. Defaults to self.solution.
+        Returns:
+            A 3-tuple containing a boolean value indicating whether the QUBO is feasible or not, a list of variables
+            that violate constraints, and the list of violated constraints. If feasible, (True, [], []) is returned.
+        """
+
+        # Resolve data
+        if data is None:
+            data = self.solution.reshape(-1)
+        else:
+            data = np.array(data).reshape(-1)
+
+        # Get constraint violation data
+        return self.qp.get_feasibility_info(data)
+
+    def solve(self, **params):
+
+        """Solve the QUBO using the selected solver.
+        Args:
+            params: Parameters to send to the selected backend solver. You may also specify the solver to select a
+                different solver and override the specified self.solver.
+        """
+
+        # Resolve solver
+        params.setdefault('solver', self.solver)
+
+        # Solve
+        self.backend.solve(**params)
+
+Code cell <ehLtQLSCFiIf>
+#%% [code]
+class FullQuboSolver(VehicleRouter):
+
+    """FQS Solver implementation."""
+
+    def __init__(self, n_clients, n_vehicles, cost_matrix, **params):
+
+        """Initializes any required variables and calls init of super class."""
+
+        # Call parent initializer
+        super().__init__(n_clients, n_vehicles, cost_matrix, **params)
+
+    def build_quadratic_program(self):
+
+        """Builds the required quadratic program and sets the names of variables in self.variables."""
+
+        # Initialization
+        self.qp = QuadraticProgram(name='Vehicle Routing Problem')
+
+        # Designate variable names
+        self.variables = np.array([[['x.{}.{}.{}'.format(i, j, k) for k in range(1, self.n + 1)]
+                                    for j in range(self.n + 1)] for i in range(1, self.m + 1)])
+
+        # Add variables to quadratic program
+        for var in self.variables.reshape(-1):
+            self.qp.binary_var(name=var)
+
+        # Build objective function
+        obj_linear_a = {self.variables[m, n, 0]: self.cost[0, n] for m in range(self.m) for n in range(1, self.n + 1)}
+        obj_linear_b = {self.variables[m, n, -1]: self.cost[n, 0] for m in range(self.m) for n in range(1, self.n + 1)}
+        obj_quadratic = {(self.variables[m, i, n], self.variables[m, j, n + 1]): self.cost[i, j] for m in range(self.m)
+                         for n in range(self.n - 1) for i in range(self.n + 1) for j in range(self.n + 1)}
+
+        # Add objective to quadratic program
+        self.qp.minimize(linear=dict(Counter(obj_linear_a) + Counter(obj_linear_b)), quadratic=obj_quadratic)
+
+        # Add constraints - single delivery per client
+        for k in range(1, self.n + 1):
+            constraint_linear = {self.variables[i, k, j]: 1 for i in range(self.m) for j in range(self.n)}
+            self.qp.linear_constraint(linear=constraint_linear, sense='==', rhs=1, name=f'single_delivery_{k}')
+
+        # Add constraints - vehicle at one place at one time
+        for m in range(self.m):
+            for n in range(self.n):
+                constraint_linear = {self.variables[m, k, n]: 1 for k in range(self.n + 1)}
+                self.qp.linear_constraint(linear=constraint_linear, sense='==', rhs=1,
+                                          name=f'single_location_{m + 1}_{n + 1}')
+
+    def visualize(self, xc=None, yc=None):
+
+        """Visualizes solution.
+        Args:
+            xc: x coordinates of nodes. Defaults to random values.
+            yc: y coordinates of nodes. Defaults to random values.
+        """
+
+        # Resolve coordinates
+        if xc is None:
+            xc = (np.random.rand(self.n + 1) - 0.5) * 10
+        if yc is None:
+            yc = (np.random.rand(self.n + 1) - 0.5) * 10
+
+        # Initialize figure
+        plt.figure()
+        ax = plt.gca()
+        ax.set_title(f'Vehicle Routing Problem - {self.n} Clients & {self.m} Cars')
+        cmap = plt.cm.get_cmap('Accent')
+
+        # Build graph
+        G = nx.MultiDiGraph()
+        G.add_nodes_from(range(self.n + 1))
+
+        # Plot nodes
+        pos = {i: (xc[i], yc[i]) for i in range(self.n + 1)}
+        labels = {i: str(i) for i in range(self.n + 1)}
+        nx.draw_networkx_nodes(G, pos=pos, ax=ax, node_color='b', node_size=500, alpha=0.8)
+        nx.draw_networkx_labels(G, pos=pos, labels=labels, font_size=16)
+
+        # Loop over cars
+        for i in range(self.solution.shape[0]):
+
+            # Get route
+            var_list = np.transpose(self.variables[i]).reshape(-1)
+            sol_list = np.transpose(self.solution[i]).reshape(-1)
+            active_vars = [var_list[k] for k in range(len(var_list)) if sol_list[k] == 1]
+            route = [int(var.split('.')[2]) for var in active_vars]
+
+            # Plot edges
+            edgelist = [(0, route[0])] + [(route[j], route[j + 1]) for j in range(len(route) - 1)] + [(route[-1], 0)]
+            G.add_edges_from(edgelist)
+            nx.draw_networkx_edges(G, pos=pos, edgelist=edgelist, width=2, edge_color=rgb2hex(cmap(i)))
+
+        # Show plot
+        plt.grid(True)
+        plt.show()
+
+Code cell <JuCiocIAEmCJ>
+#%% [code]
+class CapcFullQuboSolver(FullQuboSolver):
+
+    """Capacitated FQS Solver implementation."""
+
+    def __init__(self, n_clients, n_vehicles, cost_matrix, capacity, demand, **params):
+
+        """Initializes any required variables and calls init of super class."""
+
+        # Store capacity data
+        self.capacity = capacity
+        self.demand = demand
+
+        # Call parent initializer
+        super().__init__(n_clients, n_vehicles, cost_matrix, **params)
+
+    def build_quadratic_program(self):
+
+        """Builds the required quadratic program and sets the names of variables in self.variables."""
+
+        # Build quadratic program without capacity
+        super().build_quadratic_program()
+
+        # Add capacity constraints
+        for i in range(self.m):
+            constraint = {self.variables[i, j + 1, k]: self.demand[j] for j in range(self.n) for k in range(self.n)}
+            self.qp.linear_constraint(linear=constraint, sense='<=', rhs=self.capacity[i], name=f'capacity_{i}')
+
+Code cell <euDWAQ8jNkdp>
+#%% [code]
