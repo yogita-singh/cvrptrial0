@@ -1,0 +1,3 @@
+pip install qiskit
+pip install dwave-qiskit-plugin
+
